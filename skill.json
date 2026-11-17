@@ -1,0 +1,6 @@
+{
+  "name": "colab-operator",
+  "version": "1.0.0",
+  "description": "Operate Google Colab environments via the colab CLI with autonomous self-improvement deployment loop.",
+  "entry": "SKILL.md"
+}
