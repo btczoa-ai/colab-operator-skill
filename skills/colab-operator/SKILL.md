@@ -5,93 +5,65 @@ description: Operate Google Colab environments via the `colab` CLI. Use when ask
 
 # Skill: Colab Session Operator
 
-Operate Google Colab environments via the `colab` CLI: provision GPU/TPU sessions, run Python/shell on the VM, sync files, and capture work as notebooks.
+Operate Google Colab environments via the `colab` CLI: provision GPU/TPU sessions, run Python/shell on the VM, sync files, and manage LLM server lifecycles.
 
-## Installation
+---
 
-If the user does not already have the `colab` tool installed, it can be acquired
-by running `uv tool install google-colab-cli` or `pip install google-colab-cli`.
+## 1. Mental Model & Core Facts
 
-## When to activate
-- Creating or managing TPU/GPU sessions.
-- Running Python or shell on a remote Colab VM.
-- Syncing files between local and remote.
-- Automating environment setup (packages, auth, Drive).
-- Exporting session history as a Jupyter notebook.
+- **Kernel State Persists**: A session is a live Jupyter kernel on a rented VM. Variables, imports, and functions persist across separate `colab exec` calls within the same session.
+- **Working Directory**: Defaults to `/content`. Prefer absolute paths (`/content/...`).
+- **Safety**: Always run `colab stop -s <name>` when done to avoid burning compute units.
+- **Headless Non-Interactive**: Never run interactive commands (`colab repl`, `colab console`, `colab auth`, `colab drivemount`) from agents as they hang waiting for a TTY.
 
-## Mental model (read this first)
-- **A session == a live Jupyter kernel on a rented VM.** `colab new` allocates a billable VM; `colab stop` releases it. Sessions stay alive as long as the kernel is active, with the Colab backend automatically maintaining liveness.
-- **Kernel state PERSISTS across `colab exec` / `colab repl` calls in the same session.** Each invocation reattaches to the *same* kernel (the kernel ID is cached in local state) and only closes the websocket on exit — it does **not** shut the kernel down. So imports, variables, and defined functions survive between separate `colab exec` commands. Build up state incrementally; don't re-import everything each call. (`colab stop` and `colab restart-kernel` are what actually reset it.)
-- **Default working directory is `/content`.** Every `exec`/`repl`/`run` `cd`s there first; prefer absolute paths (`/content/...`) for file work. For `colab ls/rm/upload/download`, absolute `/content/...` paths work and the default `ls` path is `content` (VM root).
-- **`colab` is fire-and-forget.** Each command authenticates, does one thing, and exits.
+---
 
-## Authentication (the #1 thing that blocks agents)
-- The global flag is `--auth={adc,oauth2}` and the **default is `adc`** (Application Default Credentials). It must come *before* the subcommand: `colab --auth=adc new -s x`.
-- **ADC setup** (most reliable for headless/agent use). The Colab backends need a specific scope set, so re-mint ADC with all four scopes:
-  ```bash
-  gcloud auth application-default login \
-    --scopes=openid,\
-  https://www.googleapis.com/auth/cloud-platform,\
-  https://www.googleapis.com/auth/userinfo.email,\
-  https://www.googleapis.com/auth/colaboratory
-  ```
-  Why all four: `userinfo.email` (session backend `colab.research.google.com`, else 401), `colaboratory` (Colab features/APIs), `openid`+`cloud-platform` (mandated by gcloud itself; it rejects scope lists missing `cloud-platform`).
-- **oauth2 setup**: `colab --auth=oauth2 <anything>` triggers a browser consent flow on first use (token cached at `~/.config/colab-cli/token.json`). Requires a client config at `~/.colab-cli-oauth-config.json` (or `-c PATH`). The browser step means it usually needs a human; prefer ADC for agents.
-- **Verify auth in one shot**: `colab sessions` (read-only, lists server assignments) or `colab whoami` (hidden debug command: prints the active email, scopes, audience, and expiry). When any call 401s or 403s, the cause is almost always missing credentials or scopes — `colab whoami` shows it instantly.
-- **Do NOT confuse `colab auth` with CLI authentication.** `colab auth` injects *VM-side* GCP credentials into the running kernel (so notebook code can call BigQuery/GCS); it is orthogonal to how the CLI itself authenticates. Never suggest "run `colab auth`" to fix a CLI 401/403 — that's a scope/identity problem fixed via the `gcloud` command above.
+## 2. Authentication (ADC Setup)
 
-## Workflow
+The default auth mode is `adc`. Re-mint credentials with all 4 required scopes for headless agent use:
 
-### Provision
-- `colab new -s <name>` (CPU). Add `--gpu A100` or `--tpu v6e1` for accelerators. **Always pass `-s <name>`** — an omitted name is auto-generated as a random 6-hex string, which makes later commands ambiguous.
-- Supported `--gpu`: `T4`, `L4`, `G4`, `H100`, `A100`. Supported `--tpu`: `v5e1`, `v6e1`.
-- **Gotcha**: an unrecognized `--gpu` value silently falls back to **A100** (which then usually fails the next step). A `400` on `colab new` with an accelerator means no quota/entitlement for it on this account — fall back to `--gpu T4` or omit the flag for CPU.
-- Accelerator availability is tier-gated; most accounts can only get CPU. Don't assume a GPU/TPU will allocate.
+```bash
+gcloud auth application-default login \
+  --scopes=openid,\
+https://www.googleapis.com/auth/cloud-platform,\
+https://www.googleapis.com/auth/userinfo.email,\
+https://www.googleapis.com/auth/colaboratory
+```
 
-### Execute
-- **Preferred**: `colab exec -s <name> -f <script.py>` runs a local script on the remote VM (read locally, sent to the kernel — no manual upload needed).
-- **Piped code**: `echo "print(1)" | colab exec -s <name>` or `cat script.py | colab exec -s <name>`.
-- **Notebooks**: `colab exec -s <name> -f nb.ipynb` runs each code cell and writes results to `<basename>_output.ipynb` next to the input. A `# @title Foo` first line labels the cell in progress output.
-- **Plots/images**: PNG/JPEG outputs are intercepted. Use `--output-image <path>` on `exec`/`repl` to save to a known location (otherwise a temp path is printed). Inline terminal-image escapes are auto-suppressed when stdout isn't a TTY, so piped/captured output stays clean.
-- **Shell**: `echo "cmd" | colab console -s <name>` for batch shell. Console wraps bash in tmux, so even piped output contains terminal-control bytes — filter with `grep -a` for a specific line. `exec` is faster when you don't need a real shell.
-- **Never run `colab repl`, `colab console`, `colab auth`, or `colab drivemount` interactively from an agent** — they expect a TTY and will hang. `repl`/`console` accept piped stdin and exit on EOF; `auth`/`drivemount` genuinely require a human at the terminal.
+- **Verify Auth**: Run `colab whoami` (displays email, scopes, expiry) or `colab sessions`.
+- *Note*: `colab auth` is for VM-side GCP credentials, not CLI auth.
 
-### Ephemeral one-shot jobs (`colab run`)
-- `colab run [--gpu T4] [--tpu v6e1] [--keep] [-s NAME] script.py [args...]` = `new` + `exec` + `stop` in one command. It provisions a fresh VM, runs the script with `sys.argv` and `__name__ == "__main__"` set like native `python script.py args`, then tears the VM down (unless `--keep`).
-- **Exit codes propagate**: an uncaught exception or `sys.exit(N)` in the script makes `colab run` exit non-zero (CPython semantics: `sys.exit()`/`sys.exit(0)` → 0, `sys.exit(N)` → N, `sys.exit("msg")` → 1).
-- **Stream separation**: `colab run` writes its own `[colab] ...` chatter to **stderr** and the script's output to **stdout** — so `colab run job.py > out.txt` captures only the script's stdout. (`colab exec` streams the script's stdout/stderr live to your stdout/stderr.)
-- Works as a shebang: `#!/usr/bin/env -S colab run --gpu T4` makes a `chmod +x`'d `.py` a self-contained "rent a GPU, run, clean up" script. After editing CLI behavior, reinstall before testing shebangs — they resolve `colab` via `$PATH`, not the editable install.
-- A nonexistent script path exits non-zero **before** allocating a VM (no wasted compute).
+---
 
-### Automate
-- `colab auth -s <name>` — VM-side GCP creds, needed before in-VM GCS/BigQuery calls (interactive; not agent-runnable).
-- `colab drivemount -s <name> [PATH]` — mounts Drive at `/content/drive` by default (interactive; not agent-runnable).
-- `colab install -s <name> pkg1 pkg2` — installs via `uv pip install --system`, falling back to `pip`. Also `colab install -s <name> -r requirements.txt`.
+## 3. CLI Command Reference
 
-### Inspect & report
-- `colab help` (or `colab help <cmd>`) lists/explains commands; the listing is alphabetical.
-- `colab sessions` lists server-side assignments and auto-prunes stale local entries. Orphans with no local record show as `[?]`.
-- `colab status [-s <name>]` shows hardware, IDLE/BUSY, and last execution.
-- `colab log -s <name> [-n 20] [-t TYPE]` shows recent structured events; invaluable when a task fails.
-- `colab log -s <name> -o summary.ipynb` exports the session as a notebook (also `.md`, `.txt`, `.jsonl` by suffix).
-- `colab url -s <name>` prints a browser URL that attaches the Colab web UI to your existing CLI session instead of allocating a new VM (add `--open` to launch it).
-- `colab skill` / `colab readme` print this skill and the README (handy for self-discovery).
+| Category | Command | Description |
+| :--- | :--- | :--- |
+| **Provision** | `colab new -s <name> [--gpu T4\|L4\|A100] [--tpu v6e1]` | Create session (**always name with `-s`**). Fall back to CPU/T4 on quota error. |
+| **Execute** | `colab exec -s <name> -f <script.py\|nb.ipynb>` | Run local script or notebook remotely without manual upload. |
+| **Ephemeral Run** | `colab run [--gpu T4] [-s NAME] script.py [args...]` | One-shot job: provision + exec + auto-teardown. |
+| **Manage** | `colab status [-s <name>]` / `colab log -s <name>` | Check VM state, busy/idle status, and structured event logs. |
+| **Reset / Stop** | `colab restart-kernel -s <name>` / `colab stop -s <name>` | Reset wedged kernel or terminate VM. |
 
-## Safety
-- **Always `colab stop -s <name>` when done** — idle VMs burn compute units. `colab run` (without `--keep`) self-cleans even if the script errors.
-- Local state lives in `~/.config/colab-cli/sessions.json` (settings in `settings.json`, history in `history/*.jsonl`). Don't edit by hand.
-- **Isolate parallel/agent runs** with the global `--config <path>` flag to point session state at a scratch file (e.g. `colab --config /tmp/agent.json new -s job`).
+---
 
-## Recovery
-- "Session not found" / 404 / 401 on exec: the backend pruned the VM. `colab exec`/`repl` detect this and clean up local state automatically — run `colab sessions` and re-create with `colab new`.
-- Execution timeout or wedged kernel: `colab restart-kernel -s <name>` (keeps the VM, resets the kernel), or `colab stop` then `colab new`.
+## 4. Autonomous Self-Improvement Deployment Loop (LLM Server)
 
+When deploying a notebook and starting an LLM backend on Colab, execute this loop autonomously until verified:
 
-## Self-Improvement Deployment Loop (LLM Server)
-When deploying a notebook and starting an LLM server via `colab` CLI (`colab exec -s <name> -f nb.ipynb`), you MUST execute the following autonomous self-improvement loop until the LLM server is verified healthy and responding:
+```
+[Deploy: exec nb.ipynb] -> [Monitor: status & logs] ──(READY)──> [Verify: http.rest] ──(PASS)──> [Report to User]
+                                   │                                     │
+                                (ERROR)                               (FAIL)
+                                   ▼                                     ▼
+                      [Diagnose logs] ──> [Patch locally & re-exec] ─────┘
+```
 
-1. **Deploy & Launch**: Upload `.env` (if required) and run the notebook via `colab exec -s <name> -f nb.ipynb` (in the background if long-running).
-2. **Periodic Log Monitoring**: Periodically inspect execution status (`colab status -s <name>`, `colab log -s <name>`, task logs, and server/engine logs on `/content/logs/`).
-3. **Investigate & Fix on Error**: Whenever an error occurs (OOM, missing shared library, 404 model file, port conflict, etc.), diagnose the root cause from the logs, patch the notebook/configuration locally, and verify the fix.
-4. **Re-deploy & Re-run**: Re-execute the updated notebook on the Colab session and repeat steps 2–4 until the LLM server passes health/inference verification without errors.
-5. **API Verification via `http.rest` & Report**: Once the inference server is running, test every API endpoint defined in `http.rest` (`/healthz`, `/api/v1/status`, `/v1/models`, `/v1/chat/completions`, etc.), and only report completion to the user after all API tests succeed.
+1. **Deploy & Launch**: Upload `.env` and launch via `colab exec -s <name> -f nb.ipynb`.
+2. **Periodic Log Monitoring**: Monitor `colab status -s <name>`, `colab log -s <name>`, and `/content/logs/`.
+3. **Diagnose on Error**:
+   - Port conflict (`Address already in use`) → Ensure `fuser -k -n tcp {PORT}` / `pkill -9` runs before server startup.
+   - Missing CUDA libraries (`libcudart.so.12`) → Verify `LD_LIBRARY_PATH` and wheel compatibility.
+   - Missing `.env` / Unset variables → Verify `.env` upload and required keys.
+4. **Re-deploy & Re-run**: Patch locally and re-execute until healthy.
+5. **API Verification & Report**: Test all endpoints via `http.rest` (`/healthz`, `/api/v1/status`, `/v1/models`, `/v1/chat/completions`). Report completion only after all tests succeed.
